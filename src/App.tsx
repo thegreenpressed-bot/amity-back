@@ -5,6 +5,8 @@
 
 import React, { useState, useEffect } from 'react';
 import { Sparkles, CheckCircle2, ShieldAlert, Heart, RefreshCw, Eye } from 'lucide-react';
+import { collection, doc, onSnapshot, setDoc, deleteDoc, updateDoc } from 'firebase/firestore';
+import { db, handleFirestoreError, OperationType } from './utils/firebase';
 import Header from './components/Header';
 import Hero from './components/Hero';
 import ContributeForm from './components/ContributeForm';
@@ -12,7 +14,6 @@ import ContributorsList from './components/ContributorsList';
 import AdminPanel from './components/AdminPanel';
 import { Contribution, FundSettings } from './types';
 import { SEED_CONTRIBUTIONS, DEFAULT_SETTINGS } from './seedData';
-import { safeStorage } from './utils/storage';
 
 interface SaveStructure {
   settings: FundSettings;
@@ -20,57 +21,82 @@ interface SaveStructure {
 }
 
 export default function App() {
-  const [data, setData] = useState<SaveStructure>(() => {
-    try {
-      const persisted = safeStorage.getItem('amityBackExamFund');
-      if (persisted) {
-        const parsed = JSON.parse(persisted);
-        if (parsed && parsed.settings && parsed.contributions) {
-          return parsed;
-        }
-      }
-    } catch (e) {
-      console.error("Failed to load local storage data:", e);
-    }
-    
-    // Fallback/Seed Data if none exists
-    return {
-      settings: DEFAULT_SETTINGS,
-      contributions: SEED_CONTRIBUTIONS
-    };
+  const [data, setData] = useState<SaveStructure>({
+    settings: DEFAULT_SETTINGS,
+    contributions: SEED_CONTRIBUTIONS
   });
+  const [loading, setLoading] = useState(true);
 
-  // Save changes to localStorage
+  // Sync settings of Campaign from Firestore
   useEffect(() => {
-    try {
-      safeStorage.setItem('amityBackExamFund', JSON.stringify(data));
-    } catch (e) {
-      console.error("Effect save failed:", e);
-    }
-  }, [data]);
+    const settingsRef = doc(db, 'settings', 'main');
+    const unsubscribe = onSnapshot(settingsRef, (snapshot) => {
+      if (snapshot.exists()) {
+        const settingsData = snapshot.data();
+        const targetAmount = typeof settingsData?.targetAmount === 'number' && settingsData.targetAmount > 0 
+          ? settingsData.targetAmount 
+          : DEFAULT_SETTINGS.targetAmount;
+        const coordinatorName = typeof settingsData?.coordinatorName === 'string' && settingsData.coordinatorName.trim() !== ''
+          ? settingsData.coordinatorName
+          : DEFAULT_SETTINGS.coordinatorName;
 
-  // Ensure the data is saved before the user leaves the page safely
+        setData((prev) => ({
+          ...prev,
+          settings: { targetAmount, coordinatorName }
+        }));
+      } else {
+        // Initialize with DEFAULT_SETTINGS if not found on database side
+        setDoc(settingsRef, DEFAULT_SETTINGS).catch((err) => {
+          handleFirestoreError(err, OperationType.WRITE, 'settings/main');
+        });
+      }
+    }, (error) => {
+      handleFirestoreError(error, OperationType.GET, 'settings/main');
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Sync contributions ledger list from Firestore in real-time
   useEffect(() => {
-    const handleBeforeUnload = () => {
-      try {
-        safeStorage.setItem('amityBackExamFund', JSON.stringify(data));
-      } catch (e) {
-        console.error("Unload save failed:", e);
-      }
-    };
-    try {
-      window.addEventListener('beforeunload', handleBeforeUnload);
-    } catch (e) {
-      console.warn("Could not register beforeunload event listener (sandboxed iframe constraints):", e);
-    }
-    return () => {
-      try {
-        window.removeEventListener('beforeunload', handleBeforeUnload);
-      } catch (e) {
-        console.warn("Could not remove beforeunload event listener:", e);
-      }
-    };
-  }, [data]);
+    const contributionsRef = collection(db, 'contributions');
+    const unsubscribe = onSnapshot(contributionsRef, (snapshot) => {
+      const contributionsList: Contribution[] = [];
+      snapshot.forEach((doc) => {
+        const docData = doc.data();
+        if (docData) {
+          contributionsList.push({
+            id: docData.id || doc.id || '',
+            studentName: docData.studentName || 'Anonymous',
+            enrollmentNumber: docData.enrollmentNumber || 'N/A',
+            branch: docData.branch || 'General',
+            semester: typeof docData.semester === 'string' ? docData.semester : String(docData.semester || '1'),
+            amount: typeof docData.amount === 'number' ? docData.amount : 0,
+            paymentMethod: docData.paymentMethod || 'Other',
+            referenceNumber: docData.referenceNumber || '',
+            status: docData.status === 'Verified' || docData.status === 'Pending Verification' 
+              ? docData.status 
+              : 'Pending Verification',
+            timestamp: docData.timestamp || new Date().toISOString()
+          });
+        }
+      });
+      // Sort by timestamp descending
+      contributionsList.sort((a, b) => {
+        const tA = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+        const tB = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+        return tB - tA;
+      });
+      setData((prev) => ({
+        ...prev,
+        contributions: contributionsList
+      }));
+      setLoading(false);
+    }, (error) => {
+      handleFirestoreError(error, OperationType.LIST, 'contributions');
+      setLoading(false);
+    });
+    return () => unsubscribe();
+  }, []);
 
   // Admin visibility & security state
   const [isAdminPanelOpen, setIsAdminPanelOpen] = useState(false);
@@ -110,38 +136,25 @@ export default function App() {
 
   // Generate a unique contribution ID for each submission.
   // The ID is in the format ABEF-XXXX, where XXXX is a sequential number.
-  // Store the last used number in localStorage to ensure uniqueness across sessions.
+  // Calculates the next sequential ID based on the globally synced database entries.
   const generateContributionId = (): string => {
-    const storedLastNumber = safeStorage.getItem('amityBackExamFund_LastID');
-    let lastNumber = 0; // default initial value for a clean production database
-
-    if (storedLastNumber) {
-      const parsed = parseInt(storedLastNumber, 10);
-      if (!isNaN(parsed)) {
-        lastNumber = parsed;
-      }
-    } else {
-      // Fallback calculation from any current items inside the database if state has content
-      let maxNum = 0;
-      data.contributions.forEach((item) => {
-        const match = item.id.match(/ABEF-(\d+)/);
-        if (match) {
-          const num = parseInt(match[1], 10);
-          if (num > maxNum) {
-            maxNum = num;
-          }
+    let maxNum = 0;
+    data.contributions.forEach((item) => {
+      const match = item.id.match(/ABEF-(\d+)/);
+      if (match) {
+        const num = parseInt(match[1], 10);
+        if (num > maxNum) {
+          maxNum = num;
         }
-      });
-      lastNumber = maxNum;
-    }
+      }
+    });
 
-    const nextNumber = lastNumber + 1;
-    safeStorage.setItem('amityBackExamFund_LastID', String(nextNumber));
+    const nextNumber = maxNum + 1;
     return `ABEF-${String(nextNumber).padStart(4, '0')}`;
   };
 
   // Add new Contribution
-  const handleAddContribution = (newVal: Omit<Contribution, 'id' | 'status' | 'timestamp'>) => {
+  const handleAddContribution = async (newVal: Omit<Contribution, 'id' | 'status' | 'timestamp'>) => {
     const nextId = generateContributionId();
     const entry: Contribution = {
       ...newVal,
@@ -150,74 +163,90 @@ export default function App() {
       timestamp: new Date().toISOString()
     };
 
-    setData((prev) => ({
-      ...prev,
-      contributions: [entry, ...prev.contributions]
-    }));
-
-    triggerToast(
-      "Submission Received! 🎉",
-      `Your transaction ID ${nextId} is recorded and pending confirmation by the coordinator.`,
-      'success'
-    );
+    try {
+      await setDoc(doc(db, 'contributions', nextId), entry);
+      triggerToast(
+        "Submission Received! 🎉",
+        `Your transaction ID ${nextId} is recorded and pending confirmation by the coordinator.`,
+        'success'
+      );
+    } catch (e) {
+      console.error("Failed to add contribution in Firestore:", e);
+      triggerToast(
+        "Submission Error",
+        "Could not save your contribution securely. Please retry.",
+        'deleted'
+      );
+      handleFirestoreError(e, OperationType.CREATE, `contributions/${nextId}`);
+    }
   };
 
   // Change contribution status (Verify/Unverify)
-  const handleVerify = (id: string, newStatus: 'Pending Verification' | 'Verified') => {
-    setData((prev) => ({
-      ...prev,
-      contributions: prev.contributions.map((item) =>
-        item.id === id ? { ...item, status: newStatus } : item
-      )
-    }));
-
-    triggerToast(
-      newStatus === 'Verified' ? "Contribution Verified! ✅" : "Status Changed to Pending ⏳",
-      `Record ${id} has been successfully updated.`,
-      newStatus === 'Verified' ? 'success' : 'info'
-    );
+  const handleVerify = async (id: string, newStatus: 'Pending Verification' | 'Verified') => {
+    try {
+      await updateDoc(doc(db, 'contributions', id), { status: newStatus });
+      triggerToast(
+        newStatus === 'Verified' ? "Contribution Verified! ✅" : "Status Changed to Pending ⏳",
+        `Record ${id} has been successfully updated.`,
+        newStatus === 'Verified' ? 'success' : 'info'
+      );
+    } catch (e) {
+      console.error("Failed to update status in Firestore:", e);
+      handleFirestoreError(e, OperationType.UPDATE, `contributions/${id}`);
+    }
   };
 
   // Delete submission
-  const handleDelete = (id: string) => {
-    setData((prev) => ({
-      ...prev,
-      contributions: prev.contributions.filter((item) => item.id !== id)
-    }));
-
-    triggerToast(
-      "Submission Record Deleted",
-      `The contribution record ${id} has been pruned from the ledger.`,
-      'deleted'
-    );
+  const handleDelete = async (id: string) => {
+    try {
+      await deleteDoc(doc(db, 'contributions', id));
+      triggerToast(
+        "Submission Record Deleted",
+        `The contribution record ${id} has been pruned from the ledger.`,
+        'deleted'
+      );
+    } catch (e) {
+      console.error("Failed to delete contribution in Firestore:", e);
+      handleFirestoreError(e, OperationType.DELETE, `contributions/${id}`);
+    }
   };
 
   // Change Campaign Parameters (Settings)
-  const handleSaveSettings = (newSettings: FundSettings) => {
-    setData((prev) => ({
-      ...prev,
-      settings: newSettings
-    }));
-    triggerToast(
-      "Campaign Settings Applied ⚙️",
-      `Target amount: ₹${newSettings.targetAmount.toLocaleString('en-IN')}`,
-      'info'
-    );
+  const handleSaveSettings = async (newSettings: FundSettings) => {
+    try {
+      await setDoc(doc(db, 'settings', 'main'), newSettings);
+      triggerToast(
+        "Campaign Settings Applied ⚙️",
+        `Target amount: ₹${newSettings.targetAmount.toLocaleString('en-IN')}`,
+        'info'
+      );
+    } catch (e) {
+      console.error("Failed to save settings to Firestore:", e);
+      handleFirestoreError(e, OperationType.WRITE, 'settings/main');
+    }
   };
 
-  // Completely reset database back to seed template
-  const handleResetSeedData = () => {
-    setData({
-      settings: DEFAULT_SETTINGS,
-      contributions: SEED_CONTRIBUTIONS
-    });
-    setIsAdminUnlocked(false);
-    setIsAdminPanelOpen(false);
-    triggerToast(
-      "Database Refreshed! 🔄",
-      "Contributions reset back to standard tutorial seed values.",
-      'info'
-    );
+  // Completely reset database back to seed template in Firestore
+  const handleResetSeedData = async () => {
+    try {
+      // Reset settings
+      await setDoc(doc(db, 'settings', 'main'), DEFAULT_SETTINGS);
+
+      // Clean all contributions
+      const promises = data.contributions.map((item) => deleteDoc(doc(db, 'contributions', item.id)));
+      await Promise.all(promises);
+
+      setIsAdminUnlocked(false);
+      setIsAdminPanelOpen(false);
+      triggerToast(
+        "Database Refreshed! 🔄",
+        "Contributions reset back to standard tutorial seed values.",
+        'info'
+      );
+    } catch (e) {
+      console.error("Error refreshing Firebase database:", e);
+      handleFirestoreError(e, OperationType.WRITE, 'reset_database');
+    }
   };
 
   // Unlock Admin Security
@@ -242,6 +271,15 @@ export default function App() {
   const totalVerifiedSum = totalAmountSubmittedList
     .filter((c) => c.status === 'Verified')
     .reduce((acc, c) => acc + c.amount, 0);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex flex-col justify-center items-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-stone-800"></div>
+        <p className="mt-4 text-stone-600 font-sans font-medium text-sm">Synchronizing ledger...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col justify-between font-sans">
@@ -290,7 +328,7 @@ export default function App() {
             {data.settings.coordinatorName} | Amity University
           </p>
           <p className="text-[11px] text-stone-500 font-light max-w-lg mx-auto leading-relaxed">
-            All submitted transaction reference IDs, student enrollment information, and contribution statistics are strictly stored in local browser environment space. Subject to college clearance.
+            All submitted transaction reference IDs, student enrollment information, and contribution statistics are securely synced onto a persistent cloud ledger. Subject to college clearance.
           </p>
           <div className="flex justify-center items-center space-x-2 text-[10px] text-stone-600 font-mono mt-4">
             <Heart className="h-3 w-3 text-red-700 fill-red-700 inline animate-pulse" />

@@ -1,0 +1,42 @@
+{
+  "entities": {
+    "Contribution": {
+      "title": "Contribution",
+      "description": "A student's contribution to the exam fund",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Sequential ID like ABEF-0001" },
+        "studentName": { "type": "string" },
+        "enrollmentNumber": { "type": "string" },
+        "branch": { "type": "string" },
+        "semester": { "type": "string" },
+        "amount": { "type": "number" },
+        "paymentMethod": { "type": "string", "enum": ["UPI"] },
+        "referenceNumber": { "type": "string" },
+        "status": { "type": "string", "enum": ["Pending Verification", "Verified"] },
+        "timestamp": { "type": "string", "description": "ISO format timestamp" }
+      },
+      "required": ["id", "studentName", "enrollmentNumber", "branch", "semester", "amount", "paymentMethod", "status", "timestamp"]
+    },
+    "FundSettings": {
+      "title": "FundSettings",
+      "description": "Global settings for the fund",
+      "type": "object",
+      "properties": {
+        "targetAmount": { "type": "number" },
+        "coordinatorName": { "type": "string" }
+      },
+      "required": ["targetAmount", "coordinatorName"]
+    }
+  },
+  "firestore": {
+    "/contributions/{id}": {
+      "schema": "Contribution",
+      "description": "Collection of all submitted contributions"
+    },
+    "/settings/main": {
+      "schema": "FundSettings",
+      "description": "Global config of target amount and coordinator name"
+    }
+  }
+}
