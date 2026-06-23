@@ -1,0 +1,6 @@
+{
+  "name": "Amity Back Exam Fund",
+  "description": "A student contribution and collection tracker for Amity University back exam paper fees, featuring secure local storage, admin verification dashboards, and statistics tracking.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
